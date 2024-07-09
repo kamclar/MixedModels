@@ -2,92 +2,63 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
-from statsmodels.formula.api import ols, wls
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from statsmodels.formula.api import mixedlm
+from statsmodels.stats.multitest import multipletests
 import streamlit as st
 from tabulate import tabulate
 import io
 import base64
 from io import StringIO
 
-def analyze_standard_anova(data, groups):
-    df = pd.DataFrame(data.T, columns=groups * 3)
-
-    normalized_values = []
-    for i in range(0, len(groups) * 3, 3):
-        avg_first_row = df.iloc[:, i].mean()
-        for j in range(3):
-            normalized_values.append(df.iloc[:, i + j] / avg_first_row)
-
-    all_normalized_values = []
+def analyze_mixed_effects(data, groups):
+    # Reshape data into long format for mixed-effects modeling
     group_labels = []
-    for i in range(len(groups)):
-        for j in range(i, len(normalized_values), 3):
-            valid_values = normalized_values[j].dropna()
-            all_normalized_values.extend(valid_values)
-            group_labels.extend([groups[i]] * len(valid_values))
+    biorep_labels = []
+    techrep_labels = []
+    values = []
 
-    anova_df = pd.DataFrame({'value': all_normalized_values, 'group': group_labels})
+    biorep_count = len(data) // (len(groups) * 3)
 
-    model = ols('value ~ C(group)', data=anova_df).fit()
-    anova_table = sm.stats.anova_lm(model, typ=2)
+    for i, group in enumerate(groups):
+        for biorep in range(biorep_count):
+            for techrep in range(3):
+                idx = biorep * (len(groups) * 3) + i * 3 + techrep
+                values.append(data[idx, techrep])
+                group_labels.append(group)
+                biorep_labels.append(f'biorep_{biorep + 1}')
+                techrep_labels.append(f'techrep_{techrep + 1}')
+    
+    anova_df = pd.DataFrame({
+        'value': values,
+        'group': group_labels,
+        'biorep': biorep_labels,
+        'techrep': techrep_labels
+    })
 
-    tukey = pairwise_tukeyhsd(endog=anova_df['value'], groups=anova_df['group'], alpha=0.05)
-    significant_pairs = tukey.reject
+    # Fit a mixed-effects model
+    model = mixedlm("value ~ group", data=anova_df, groups=anova_df["biorep"])
+    result = model.fit()
 
-    means = []
-    std_devs = []
+    # Extract pairwise comparisons
+    comparisons = []
+    p_values = []
+    groups_combinations = [(g1, g2) for i, g1 in enumerate(groups) for g2 in groups[i+1:]]
+    for g1, g2 in groups_combinations:
+        subset = anova_df[anova_df['group'].isin([g1, g2])]
+        submodel = mixedlm("value ~ group", data=subset, groups=subset["biorep"]).fit()
+        comparison = submodel.t_test_pairwise('group').result_frame
+        comparisons.append((g1, g2))
+        p_values.append(comparison['P>|t|'][1])
 
-    for group in groups:
-        group_values = anova_df[anova_df['group'] == group]['value']
-        means.append(np.mean(group_values))
-        std_devs.append(np.std(group_values))
+    # Adjust p-values for multiple comparisons using Holm-Bonferroni method
+    reject, pvals_corrected, _, _ = multipletests(p_values, method='holm')
 
-    return anova_df, anova_table, tukey, significant_pairs, means, std_devs, "Standard ANOVA"
+    return anova_df, result.summary(), comparisons, reject
 
-def analyze_weighted_anova(data, groups):
-    df = pd.DataFrame(data.T, columns=groups * 3)
+def plot_results(groups, anova_df, comparisons, reject):
+    means = anova_df.groupby('group')['value'].mean()
+    std_devs = anova_df.groupby('group')['value'].std()
 
-    normalized_values = []
-    for i in range(0, len(groups) * 3, 3):
-        avg_first_row = df.iloc[:, i].mean()
-        for j in range(3):
-            normalized_values.append(df.iloc[:, i + j] / avg_first_row)
-
-    all_normalized_values = []
-    group_labels = []
-    weights = []
-    for i in range(len(groups)):
-        for j in range(i, len(normalized_values), 3):
-            valid_values = normalized_values[j].dropna()
-            row_length = len(valid_values)
-            weight = 1 / row_length
-            all_normalized_values.extend(valid_values)
-            group_labels.extend([groups[i]] * row_length)
-            weights.extend([weight] * row_length)
-
-    total_observations = len(all_normalized_values)
-    weights = [w * total_observations / sum(weights) for w in weights]
-
-    anova_df = pd.DataFrame({'value': all_normalized_values, 'group': group_labels, 'weights': weights})
-
-    model = wls('value ~ C(group)', data=anova_df, weights=anova_df['weights']).fit()
-    anova_table = sm.stats.anova_lm(model, typ=2)
-
-    tukey = pairwise_tukeyhsd(endog=anova_df['value'], groups=anova_df['group'], alpha=0.05)
-    significant_pairs = tukey.reject
-
-    means = []
-    std_devs = []
-
-    for group in groups:
-        group_values = anova_df[anova_df['group'] == group]['value']
-        means.append(np.mean(group_values))
-        std_devs.append(np.std(group_values))
-
-    return anova_df, anova_table, tukey, significant_pairs, means, std_devs, "Weighted ANOVA"
-
-def plot_results(groups, anova_df, tukey, significant_pairs, means, std_devs, analysis_type):
     def add_significance(ax, x1, x2, y, h, text):
         ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.5, color='black')
         ax.text((x1 + x2) * .5, y + h, text, ha='center', va='bottom', color='black', fontsize=12)
@@ -96,27 +67,24 @@ def plot_results(groups, anova_df, tukey, significant_pairs, means, std_devs, an
     fig, ax = plt.subplots(figsize=(8, 8))
     bars = ax.bar(groups, means, yerr=std_devs, capsize=10, color='#88c7dc')
 
-    ax.set_title(f'Comparison of Group Means ({analysis_type})', fontsize=15)
+    ax.set_title('Comparison of Group Means (Mixed Effects)', fontsize=15)
     ax.set_ylabel('Mean Values', fontsize=12)
 
-    if np.any(significant_pairs):
+    if np.any(reject):
         max_val = max(means) + max(std_devs)
         h = max_val * 0.05
         gap = max_val * 0.02
         whisker_gap = max_val * 0.02
 
-        comparisons = np.array(tukey.summary().data[1:])
-        significant_comparisons = comparisons[significant_pairs]
-
-        for comp in significant_comparisons:
-            if 'siRNA_ctrl' in comp[:2]:
-                group1 = groups.index(comp[0])
-                group2 = groups.index(comp[1])
+        for (g1, g2), sig in zip(comparisons, reject):
+            if sig:
+                group1 = groups.index(g1)
+                group2 = groups.index(g2)
                 add_significance(ax, group1, group2, max_val + whisker_gap, h, '*')
                 whisker_gap += h + gap
 
     ax.set_facecolor('white')
-    fig.patch.set_facecolor('white')
+    fig.patch.set.facecolor('white')
     ax.grid(False)
 
     buf = io.BytesIO()
@@ -128,10 +96,13 @@ def plot_results(groups, anova_df, tukey, significant_pairs, means, std_devs, an
 
     return plot_url
 
-def display_table(anova_table, tukey):
-    anova_table_html = anova_table.to_html(classes='table table-striped')
-    tukey_summary_html = tukey.summary().as_html()
-    return anova_table_html, tukey_summary_html
+def display_table(summary, comparisons, reject):
+    summary_html = summary.as_html()
+    comparisons_html = "<h4>Pairwise Comparisons (Holm-Bonferroni adjusted):</h4><table><tr><th>Group 1</th><th>Group 2</th><th>Significant</th></tr>"
+    for (g1, g2), sig in zip(comparisons, reject):
+        comparisons_html += f"<tr><td>{g1}</td><td>{g2}</td><td>{'Yes' if sig else 'No'}</td></tr>"
+    comparisons_html += "</table>"
+    return summary_html, comparisons_html
 
 def parse_pasted_data(pasted_data, delimiter):
     # Split the data into lines
@@ -147,11 +118,10 @@ def parse_pasted_data(pasted_data, delimiter):
     df = df.apply(pd.to_numeric, errors='coerce')
     return df
 
-st.title('ANOVA Analysis')
+st.title('Mixed Model Analysis')
 
-delimiter = st.selectbox('Select delimiter', (';', '\t', ','))
-
-input_method = st.radio("Select input method", ('File Upload', 'Copy-Paste'))
+delimiter = st.selectbox('Select delimiter', ( '\t', ',', ';'))
+input_method = st.radio("Select input method", ( 'Copy-Paste', 'File Upload'))
 
 if input_method == 'File Upload':
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
@@ -166,30 +136,19 @@ if (input_method == 'File Upload' and uploaded_file is not None) or (input_metho
             data = parse_pasted_data(pasted_data, delimiter)
 
         st.write("Data Preview:", data.head())
-
         data_values = data.values
-        st.text_area('Data (numpy array format):', str(data_values))
-
         groups_input = st.text_area('Groups (list format):', "['siRNA_ctrl', 'siRNA1_VTN', 'siRNA2_VTN']")
 
         if st.button('Run Analysis and Plot'):
             groups = eval(groups_input)
+            anova_df, summary, dunn = analyze_mixed_effects(data_values, groups)
 
-            # Check if any row contains NaN values indicating varying number of columns
-            contains_nan = data.isna().any(axis=1).any()
+            st.write("Analysis Type: Mixed Effects Model")
+            summary_html, dunn_html = display_table(summary, dunn)
+            plot_url = plot_results(groups, anova_df, dunn)
 
-            if contains_nan:
-                anova_df, anova_table, tukey, significant_pairs, means, std_devs, analysis_type = analyze_weighted_anova(data_values, groups)
-            else:
-                anova_df, anova_table, tukey, significant_pairs, means, std_devs, analysis_type = analyze_standard_anova(data_values, groups)
-
-            st.write(f"Analysis Type: {analysis_type}")
-
-            anova_table_html, tukey_summary_html = display_table(anova_table, tukey)
-            plot_url = plot_results(groups, anova_df, tukey, significant_pairs, means, std_devs, analysis_type)
-
-            st.markdown(anova_table_html, unsafe_allow_html=True)
-            st.markdown(tukey_summary_html, unsafe_allow_html=True)
+            st.markdown(summary_html, unsafe_allow_html=True)
+            st.markdown(dunn_html, unsafe_allow_html=True)
             st.image(f"data:image/png;base64,{plot_url}")
     except Exception as e:
         st.error(f"Error processing the file: {e}")
