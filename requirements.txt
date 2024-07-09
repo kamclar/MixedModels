@@ -4,4 +4,5 @@ pandas
 statsmodels
 matplotlib
 tabulate
-scikit_posthocs 
+scikit_posthocs
+pymer4

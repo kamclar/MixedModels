@@ -1,14 +1,15 @@
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 import matplotlib.pyplot as plt
-from statsmodels.formula.api import mixedlm
-from statsmodels.stats.multitest import multipletests
 import streamlit as st
 from tabulate import tabulate
 import io
 import base64
 from io import StringIO
+from pymer4.models import Lmer
+from scipy.stats import kruskal
+import scikit_posthocs as sp
+
 
 def analyze_mixed_effects(data, groups):
     # Reshape data into long format for mixed-effects modeling
@@ -35,27 +36,17 @@ def analyze_mixed_effects(data, groups):
         'techrep': techrep_labels
     })
 
-    # Fit a mixed-effects model
-    model = mixedlm("value ~ group", data=anova_df, groups=anova_df["biorep"])
+    # Fit a mixed-effects model using pymer4
+    model = Lmer("value ~ group + (1|biorep)", data=anova_df)
     result = model.fit()
 
-    # Extract pairwise comparisons
-    comparisons = []
-    p_values = []
-    groups_combinations = [(g1, g2) for i, g1 in enumerate(groups) for g2 in groups[i+1:]]
-    for g1, g2 in groups_combinations:
-        subset = anova_df[anova_df['group'].isin([g1, g2])]
-        submodel = mixedlm("value ~ group", data=subset, groups=subset["biorep"]).fit()
-        comparison = submodel.t_test_pairwise('group').result_frame
-        comparisons.append((g1, g2))
-        p_values.append(comparison['P>|t|'][1])
+    # Perform post-hoc analysis using estimated marginal means (EMMs)
+    emmeans = model.emmeans('group')
+    comparisons = emmeans.compare(method='holm')
+    
+    return anova_df, result, comparisons
 
-    # Adjust p-values for multiple comparisons using Holm-Bonferroni method
-    reject, pvals_corrected, _, _ = multipletests(p_values, method='holm')
-
-    return anova_df, result.summary(), comparisons, reject
-
-def plot_results(groups, anova_df, comparisons, reject):
+def plot_results(groups, anova_df, comparisons):
     means = anova_df.groupby('group')['value'].mean()
     std_devs = anova_df.groupby('group')['value'].std()
 
@@ -70,21 +61,20 @@ def plot_results(groups, anova_df, comparisons, reject):
     ax.set_title('Comparison of Group Means (Mixed Effects)', fontsize=15)
     ax.set_ylabel('Mean Values', fontsize=12)
 
-    if np.any(reject):
-        max_val = max(means) + max(std_devs)
-        h = max_val * 0.05
-        gap = max_val * 0.02
-        whisker_gap = max_val * 0.02
+    max_val = max(means) + max(std_devs)
+    h = max_val * 0.05
+    gap = max_val * 0.02
+    whisker_gap = max_val * 0.02
 
-        for (g1, g2), sig in zip(comparisons, reject):
-            if sig:
-                group1 = groups.index(g1)
-                group2 = groups.index(g2)
-                add_significance(ax, group1, group2, max_val + whisker_gap, h, '*')
-                whisker_gap += h + gap
+    for i, row in comparisons.iterrows():
+        if row['p-value'] < 0.05:
+            group1_idx = groups.index(row['group1'])
+            group2_idx = groups.index(row['group2'])
+            add_significance(ax, group1_idx, group2_idx, max_val + whisker_gap, h, '*')
+            whisker_gap += h + gap
 
     ax.set_facecolor('white')
-    fig.patch.set.facecolor('white')
+    fig.patch.set_facecolor('white')
     ax.grid(False)
 
     buf = io.BytesIO()
@@ -96,12 +86,9 @@ def plot_results(groups, anova_df, comparisons, reject):
 
     return plot_url
 
-def display_table(summary, comparisons, reject):
-    summary_html = summary.as_html()
-    comparisons_html = "<h4>Pairwise Comparisons (Holm-Bonferroni adjusted):</h4><table><tr><th>Group 1</th><th>Group 2</th><th>Significant</th></tr>"
-    for (g1, g2), sig in zip(comparisons, reject):
-        comparisons_html += f"<tr><td>{g1}</td><td>{g2}</td><td>{'Yes' if sig else 'No'}</td></tr>"
-    comparisons_html += "</table>"
+def display_table(summary, comparisons):
+    summary_html = summary.to_html(classes='table table-striped')
+    comparisons_html = comparisons.to_html(classes='table table-striped')
     return summary_html, comparisons_html
 
 def parse_pasted_data(pasted_data, delimiter):
@@ -141,14 +128,14 @@ if (input_method == 'File Upload' and uploaded_file is not None) or (input_metho
 
         if st.button('Run Analysis and Plot'):
             groups = eval(groups_input)
-            anova_df, summary, dunn = analyze_mixed_effects(data_values, groups)
+            anova_df, summary, comparisons = analyze_mixed_effects(data_values, groups)
 
             st.write("Analysis Type: Mixed Effects Model")
-            summary_html, dunn_html = display_table(summary, dunn)
-            plot_url = plot_results(groups, anova_df, dunn)
+            summary_html, comparisons_html = display_table(summary, comparisons)
+            plot_url = plot_results(groups, anova_df, comparisons)
 
             st.markdown(summary_html, unsafe_allow_html=True)
-            st.markdown(dunn_html, unsafe_allow_html=True)
+            st.markdown(comparisons_html, unsafe_allow_html=True)
             st.image(f"data:image/png;base64,{plot_url}")
     except Exception as e:
         st.error(f"Error processing the file: {e}")
