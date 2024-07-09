@@ -1,15 +1,15 @@
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 import matplotlib.pyplot as plt
+from statsmodels.formula.api import mixedlm
 import streamlit as st
 from tabulate import tabulate
 import io
 import base64
 from io import StringIO
-from pymer4.models import Lmer
 from scipy.stats import kruskal
 import scikit_posthocs as sp
-
 
 def analyze_mixed_effects(data, groups):
     # Reshape data into long format for mixed-effects modeling
@@ -36,17 +36,19 @@ def analyze_mixed_effects(data, groups):
         'techrep': techrep_labels
     })
 
-    # Fit a mixed-effects model using pymer4
-    model = Lmer("value ~ group + (1|biorep)", data=anova_df)
+    # Fit a mixed-effects model using statsmodels
+    model = mixedlm("value ~ group", data=anova_df, groups=anova_df["biorep"])
     result = model.fit()
 
-    # Perform post-hoc analysis using estimated marginal means (EMMs)
-    emmeans = model.emmeans('group')
-    comparisons = emmeans.compare(method='holm')
-    
-    return anova_df, result, comparisons
+    # Perform Kruskal-Wallis test
+    kruskal_result = kruskal(*[anova_df[anova_df['group'] == group]['value'] for group in groups])
 
-def plot_results(groups, anova_df, comparisons):
+    # Apply Dunn's test for pairwise comparisons
+    dunn = sp.posthoc_dunn(anova_df, val_col='value', group_col='group', p_adjust='holm')
+    
+    return anova_df, result.summary(), dunn
+
+def plot_results(groups, anova_df, dunn):
     means = anova_df.groupby('group')['value'].mean()
     std_devs = anova_df.groupby('group')['value'].std()
 
@@ -66,12 +68,11 @@ def plot_results(groups, anova_df, comparisons):
     gap = max_val * 0.02
     whisker_gap = max_val * 0.02
 
-    for i, row in comparisons.iterrows():
-        if row['p-value'] < 0.05:
-            group1_idx = groups.index(row['group1'])
-            group2_idx = groups.index(row['group2'])
-            add_significance(ax, group1_idx, group2_idx, max_val + whisker_gap, h, '*')
-            whisker_gap += h + gap
+    for i, group1 in enumerate(groups):
+        for j, group2 in enumerate(groups):
+            if i < j and dunn.loc[group1, group2] < 0.05:
+                add_significance(ax, i, j, max_val + whisker_gap, h, '*')
+                whisker_gap += h + gap
 
     ax.set_facecolor('white')
     fig.patch.set_facecolor('white')
@@ -86,10 +87,10 @@ def plot_results(groups, anova_df, comparisons):
 
     return plot_url
 
-def display_table(summary, comparisons):
-    summary_html = summary.to_html(classes='table table-striped')
-    comparisons_html = comparisons.to_html(classes='table table-striped')
-    return summary_html, comparisons_html
+def display_table(summary, dunn):
+    summary_html = summary.as_html()
+    dunn_html = dunn.to_html(classes='table table-striped')
+    return summary_html, dunn_html
 
 def parse_pasted_data(pasted_data, delimiter):
     # Split the data into lines
@@ -128,14 +129,14 @@ if (input_method == 'File Upload' and uploaded_file is not None) or (input_metho
 
         if st.button('Run Analysis and Plot'):
             groups = eval(groups_input)
-            anova_df, summary, comparisons = analyze_mixed_effects(data_values, groups)
+            anova_df, summary, dunn = analyze_mixed_effects(data_values, groups)
 
             st.write("Analysis Type: Mixed Effects Model")
-            summary_html, comparisons_html = display_table(summary, comparisons)
-            plot_url = plot_results(groups, anova_df, comparisons)
+            summary_html, dunn_html = display_table(summary, dunn)
+            plot_url = plot_results(groups, anova_df, dunn)
 
             st.markdown(summary_html, unsafe_allow_html=True)
-            st.markdown(comparisons_html, unsafe_allow_html=True)
+            st.markdown(dunn_html, unsafe_allow_html=True)
             st.image(f"data:image/png;base64,{plot_url}")
     except Exception as e:
         st.error(f"Error processing the file: {e}")
