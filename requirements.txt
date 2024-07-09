@@ -1,0 +1,7 @@
+streamlit
+numpy
+pandas
+statsmodels
+matplotlib
+tabulate
+scikit_posthocs 
